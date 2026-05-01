@@ -15,11 +15,7 @@
 
 #### 1. Computer Vision Pipeline (HSV Masking)
 The drone's "eye" identifying the target using color thresholding and contour detection.
-![Target Detection](./protos/Screenshot%202026-04-24%20031539.png)
-
-#### 2. Precision Hover & Capture
-The stabilization phase where the drone aligns itself at 6.5m altitude to capture the target data.
-![Hover and Capture](./protos/Screenshot%202026-05-02%20001558.png)
+![Target Detection](./controllers/controller_blue_drone/capture%003559.png)
 
 ---
 
@@ -59,6 +55,3 @@ This is the core engineering highlight. The system calculates the target's posit
 *Electrical Engineer - Computer and Industrial Control*
 
 ---
-
-### 🏷 Project Topics
-`webots` `computer-vision` `opencv` `autonomous-drones` `pid-control` `geolocation` `robotics` `target-tracking` `python`
