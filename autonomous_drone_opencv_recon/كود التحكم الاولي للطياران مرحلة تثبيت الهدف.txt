@@ -1,0 +1,133 @@
+import cv2
+import numpy as np
+from controller import Robot
+
+class Mavic2ProVisualLock:
+    def __init__(self):
+        self.robot = Robot()
+        self.time_step = int(self.robot.getBasicTimeStep())
+        
+        # 1. تعريف الحساسات
+        self.imu = self.robot.getDevice("inertial unit"); self.imu.enable(self.time_step)
+        self.gyro = self.robot.getDevice("gyro"); self.gyro.enable(self.time_step)
+        self.gps = self.robot.getDevice("gps"); self.gps.enable(self.time_step)
+        
+        # 2. تعريف الكاميرا والمحرك
+        self.camera = self.robot.getDevice("camera")
+        self.camera.enable(self.time_step)
+        self.camera_pitch_motor = self.robot.getDevice("camera pitch")
+        
+        # 3. تعريف المحركات
+        self.motors = [self.robot.getDevice(n) for n in ["front left propeller", "front right propeller", "rear left propeller", "rear right propeller"]]
+        for m in self.motors:
+            m.setPosition(float('inf'))
+            m.setVelocity(0)
+
+        # ثوابت الاستقرار (PID)
+        self.k_roll_p, self.k_roll_d = 30.0, 2.0
+        self.k_pitch_p, self.k_pitch_d = 30.0, 2.0
+        
+        # --- ثوابت "مطاردة المركز" (Visual Servoing Gains) ---
+        # زدنا القيم قليلاً لتكون الاستجابة أسرع في إعادة الهدف للمنتصف
+        self.k_tracking_pitch = 0.01  # قوة سحب الهدف لمنتصف الشاشة (طولياً)
+        self.k_tracking_roll = 0.01  # قوة سحب الهدف لمنتصف الشاشة (عرضياً)
+        self.k_tracking_yaw = 0.1    # قوة دوران الطائرة لتوجيه الكاميرا للهدف
+        
+        self.target_altitude = 6.5  
+        self.prev_altitude = 0.0
+        self.state = "TAKEOFF"
+
+    def process_vision(self):
+        raw_image = self.camera.getImage()
+        if not raw_image: return None, 0, 0
+        
+        width, height = self.camera.getWidth(), self.camera.getHeight()
+        frame = np.frombuffer(raw_image, np.uint8).reshape((height, width, 4))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+        # كشف اللون الأحمر
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, np.array([0, 150, 50]), np.array([10, 255, 255])) + \
+               cv2.inRange(hsv, np.array([170, 150, 50]), np.array([180, 255, 255]))
+        
+        target_center = None
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(c) > 300:
+                x, y, w, h = cv2.boundingRect(c)
+                target_center = (x + w//2, y + h//2)
+                
+                # رسم "نقطة الهدف" و "مركز الشاشة" للمقارنة
+                cv2.drawMarker(frame, target_center, (0, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 2)
+                cv2.circle(frame, (width//2, height//2), 5, (255, 0, 0), -1) 
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+
+        cv2.imshow("Object Centering System", frame)
+        cv2.waitKey(1)
+        return target_center, width, height
+
+    def run(self):
+        if self.camera_pitch_motor:
+            self.camera_pitch_motor.setPosition(1.2) # الكاميرا تنظر للأسفل
+
+        while self.robot.step(self.time_step) != -1:
+            roll, pitch_ang, yaw_ang = self.imu.getRollPitchYaw()
+            roll_rate, pitch_rate, yaw_rate = self.gyro.getValues()
+            altitude = self.gps.getValues()[2]
+            
+            target_pos, img_w, img_h = self.process_vision()
+            
+            # --- الارتفاع المستقر ---
+            v_vel = (altitude - self.prev_altitude) / (self.time_step / 1000.0)
+            self.prev_altitude = altitude
+            vertical_input = 68.5 + (np.clip(self.target_altitude - altitude, -1.0, 1.0) * 10.0) - (v_vel * 5.0)
+
+            desired_pitch = 0.0
+            desired_roll = 0.0
+            yaw_input = 0.0
+            
+            if self.state == "TAKEOFF":
+                if altitude >= self.target_altitude - 0.2:
+                    self.state = "SCANNING"
+            
+            elif self.state == "SCANNING":
+                desired_pitch = 0.06 # البحث للأمام
+                if target_pos:
+                    self.state = "TRACKING"
+            
+            elif self.state == "TRACKING":
+                if not target_pos:
+                    self.state = "SCANNING"
+                else:
+                    # حساب "الإزاحة" عن مركز الشاشة (من -1 إلى 1)
+                    # المركز هو (0,0)
+                    off_x = (target_pos[0] - (img_w / 2)) / (img_w / 2)
+                    off_y = (target_pos[1] - (img_h / 2)) / (img_h / 2)
+                    
+                    # --- منطق التمركز الصارم (Focus Logic) ---
+                    
+                    # 1. إذا كان الهدف يمين/يسار المركز -> دور حول نفسك (Yaw) + مل جانباً (Roll)
+                    yaw_input = -off_x * self.k_tracking_yaw
+                    desired_roll = off_x * self.k_tracking_roll
+                    
+                    # 2. إذا كان الهدف في مقدمة الشاشة (off_y سالبة) -> تقدم للأمام
+                    # وإذا كان في خلفية الشاشة (off_y موجبة) -> ارجع للخلف
+                    # الهدف هو جعل off_y دائماً صفر (في المنتصف)
+                    desired_pitch = off_y * self.k_tracking_pitch
+
+            # --- متحكم التوازن ---
+            roll_input = (desired_roll - roll) * self.k_roll_p - (roll_rate * self.k_roll_d)
+            pitch_input = (desired_pitch - pitch_ang) * self.k_pitch_p - (pitch_rate * self.k_pitch_d)
+            
+            m1 = vertical_input + roll_input - pitch_input - yaw_input
+            m2 = vertical_input - roll_input - pitch_input + yaw_input
+            m3 = vertical_input + roll_input + pitch_input + yaw_input
+            m4 = vertical_input - roll_input + pitch_input - yaw_input
+            
+            for i, val in enumerate([m1, -m2, -m3, m4]):
+                self.motors[i].setVelocity(val)
+
+controller = Mavic2ProVisualLock()
+controller.run()
